@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GOOGLE_API_KEY = "YOUR_API_KEY"  # Replace with your actual key
+GOOGLE_API_KEY = "AIzaSyC0jAjJsgxGUBOvEw8h_L5HlzRVkaS9T-0"  # Replace with your actual key
 genai.configure(api_key=GOOGLE_API_KEY)
 
 class AudioSegmentDetector:
