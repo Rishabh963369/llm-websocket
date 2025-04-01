@@ -233,6 +233,7 @@ class GeminiMultimodalProcessor:
                 image = image.resize(new_size, Image.Resampling.LANCZOS)
                 self.last_image = image
                 self.last_image_timestamp = time.time()
+                logger.info("Image successfully cached for Gemini processing")
                 return True
             except Exception as e:
                 logger.error(f"Error processing image: {e}")
@@ -244,15 +245,21 @@ class GeminiMultimodalProcessor:
             self.cancel_event.clear()
             self.current_task = asyncio.create_task(self._generate_internal(text))
             try:
-                return await self.current_task
+                result = await self.current_task
+                if result is None:
+                    logger.warning("Gemini generation returned None")
+                    return "Sorry, I couldn't generate a response. Please try again."
+                return result
             except asyncio.CancelledError:
+                logger.info("Gemini generation cancelled")
                 return None
     
     async def _generate_internal(self, text):
         try:
+            logger.info(f"Generating response for text: '{text}'")
             if not self.last_image:
                 logger.warning("No image available for multimodal generation")
-                return f"No image context: {text}"
+                return "I don't have an image to look at. Could you please send one?"
                 
             img_byte_arr = io.BytesIO()
             self.last_image.save(img_byte_arr, format='JPEG')
@@ -268,22 +275,24 @@ class GeminiMultimodalProcessor:
                 f"User input: {text}"
             )
             
+            logger.info("Calling Gemini API...")
             response = await asyncio.to_thread(
                 self.model.generate_content,
                 [prompt, {"mime_type": "image/jpeg", "data": img_bytes}]
             )
             
             if self.cancel_event.is_set():
+                logger.info("Generation cancelled during processing")
                 return None
                 
             output_text = response.text.strip()
             self.generation_count += 1
-            logger.info(f"Gemini generation result ({len(output_text)} chars)")
+            logger.info(f"Gemini generation result: '{output_text}' ({len(output_text)} chars)")
             return output_text
             
         except Exception as e:
-            logger.error(f"Gemini generation error: {e}")
-            return f"Error processing: {text}"
+            logger.error(f"Gemini generation error: {str(e)}")
+            return f"Sorry, I hit an error: {str(e)}. Please try again."
     
     async def cancel_current(self):
         """Cancel current generation"""
@@ -292,9 +301,136 @@ class GeminiMultimodalProcessor:
             self.current_task.cancel()
             try:
                 await self.current_task
-            except asyncio.CancelledError:
+            except asyncio.Cancelled CancellationError:
                 pass
         self.current_task = None
+
+async def handle_client(websocket):
+    """Handles WebSocket client connection with interrupt support"""
+    try:
+        await websocket.recv()
+        logger.info("Client connected")
+        
+        detector = AudioSegmentDetector()
+        transcriber = WhisperTranscriber.get_instance()
+        gemini_processor = GeminiMultimodalProcessor.get_instance()
+        tts_processor = KokoroTTSProcessor.get_instance()
+        
+        playback_task = None
+        
+        async def send_keepalive():
+            while True:
+                await websocket.ping()
+                await asyncio.sleep(10)
+        
+        async def detect_speech_segments():
+            nonlocal playback_task
+            while True:
+                try:
+                    speech_segment = await detector.get_next_segment()
+                    if speech_segment:
+                        transcription = await transcriber.transcribe(speech_segment)
+                        if transcription:
+                            # Cancel existing operations
+                            await gemini_processor.cancel_current()
+                            await tts_processor.cancel_current()
+                            if playback_task:
+                                playback_task.cancel()
+                                try:
+                                    await playback_task
+                                except asyncio.CancelledError:
+                                    pass
+                            
+                            logger.info(f"Processing transcription: '{transcription}'")
+                            response = await gemini_processor.generate(transcription)
+                            if response:
+                                logger.info(f"Got Gemini response: '{response}'")
+                                await detector.set_tts_playing(True)
+                                try:
+                                    audio = await tts_processor.synthesize_speech(response)
+                                    if audio is not None:
+                                        audio_bytes = (audio * 32767).astype(np.int16).tobytes()
+                                        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+                                        
+                                        await websocket.send(json.dumps({
+                                            "audio": base64_audio
+                                        }))
+                                        
+                                        async def play_audio():
+                                            total_duration = len(audio) / 24000
+                                            interval = 0.5
+                                            intervals = int(total_duration / interval)
+                                            for _ in range(intervals):
+                                                await websocket.ping()
+                                                await asyncio.sleep(interval)
+                                            remaining = total_duration - (intervals * interval)
+                                            if remaining > 0:
+                                                await websocket.ping()
+                                                await asyncio.sleep(remaining)
+                                        
+                                        playback_task = asyncio.create_task(play_audio())
+                                        await playback_task
+                                        playback_task = None
+                                    else:
+                                        logger.warning("No audio generated from TTS")
+                                finally:
+                                    await detector.set_tts_playing(False)
+                            else:
+                                logger.warning("No response generated from Gemini")
+                    await asyncio.sleep(0.01)
+                except websockets.exceptions.ConnectionClosed:
+                    break
+                except Exception as e:
+                    logger.error(f"Error detecting speech: {e}")
+                    await detector.set_tts_playing(False)
+        
+        async def receive_audio_and_images():
+            nonlocal playback_task
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    
+                    if "realtime_input" in data:
+                        await detector.cancel_current()
+                        await gemini_processor.cancel_current()
+                        await tts_processor.cancel_current()
+                        if playback_task:
+                            playback_task.cancel()
+                            try:
+                                await playback_task
+                            except asyncio.CancelledError:
+                                pass
+                            playback_task = None
+                        
+                        for chunk in data["realtime_input"]["media_chunks"]:
+                            if chunk["mime_type"] == "audio/pcm":
+                                audio_data = base64.b64decode(chunk["data"])
+                                await detector.add_audio(audio_data)
+                            elif chunk["mime_type"] == "image/jpeg" and not detector.tts_playing:
+                                image_data = base64.b64decode(chunk["data"])
+                                await gemini_processor.set_image(image_data)
+                    
+                    if "image" in data and not detector.tts_playing:
+                        image_data = base64.b64decode(data["image"])
+                        await gemini_processor.set_image(image_data)
+                        
+                except Exception as e:
+                    logger.error(f"Error receiving data: {e}")
+        
+        await asyncio.gather(
+            receive_audio_and_images(),
+            detect_speech_segments(),
+            send_keepalive(),
+            return_exceptions=True
+        )
+        
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("Connection closed")
+    except Exception as e:
+        logger.error(f"Session error: {e}")
+    finally:
+        await detector.set_tts_playing(False)
+
 
 class KokoroTTSProcessor:
     """Handles text-to-speech conversion"""
